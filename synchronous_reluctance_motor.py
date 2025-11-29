@@ -20,6 +20,101 @@ from scipy.integrate import solve_ivp
 import math
 
 
+class AlternatorAnalysis:
+    """Utility class to study synchronous generator behavior."""
+
+    def __init__(self, frequency=50.0):
+        self.frequency = frequency
+
+    def compute_parameters(self, e_open_circuit, i_short_circuit, r_a,
+                            line_voltage, load_current, power_factor):
+        """
+        Calculate synchronous impedance, reactance and no-load voltage.
+
+        Parameters
+        ----------
+        e_open_circuit : float
+            Open-circuit generated line voltage (V).
+        i_short_circuit : float
+            Short-circuit armature current (A).
+        r_a : float
+            Armature resistance per phase (Ohm).
+        line_voltage : float
+            Rated line voltage at load (V).
+        load_current : float
+            Line current drawn by the load (A).
+        power_factor : float
+            Lagging power factor of the load (0 to 1).
+
+        Returns
+        -------
+        dict
+            Dictionary containing synchronous impedance, reactance and
+            the expected no-load terminal voltage when the load is suddenly
+            removed (same excitation).
+        """
+        z_s = e_open_circuit / i_short_circuit
+        x_s = max(0.0, math.sqrt(max(z_s ** 2 - r_a ** 2, 0.0)))
+
+        v_phase = line_voltage / math.sqrt(3)
+        phi = math.acos(power_factor)
+        i_phase = load_current
+        i_complex = i_phase * (math.cos(-phi) + 1j * math.sin(-phi))
+
+        e_phase = v_phase + (r_a + 1j * x_s) * i_complex
+        v_no_load_line = abs(e_phase) * math.sqrt(3)
+        voltage_regulation = (v_no_load_line - line_voltage) / line_voltage * 100
+
+        return {
+            "z_s": z_s,
+            "x_s": x_s,
+            "e_phase": e_phase,
+            "no_load_voltage_line": v_no_load_line,
+            "voltage_regulation_pct": voltage_regulation,
+            "power_factor_angle_deg": math.degrees(phi)
+        }
+
+    def simulate_load_rejection(self, e_phase, r_a, x_s, i_initial,
+                                phi_deg, duration, step, method="RK45"):
+        """Simulate current decay and terminal voltage when the load is opened."""
+        omega = 2 * math.pi * self.frequency
+        l_s = x_s / omega if omega else 0.0
+
+        def deriv(t, i):
+            return [-i[0] * (r_a / l_s)] if l_s > 0 else [0]
+
+        times = []
+        currents = []
+        voltages = []
+
+        if method == "RK45":
+            sol = solve_ivp(
+                deriv, [0, duration], [i_initial], max_step=step, method="RK45"
+            )
+            i_values = sol.y[0]
+            times = sol.t.tolist()
+        else:
+            i_values = []
+            t = 0.0
+            i_val = i_initial
+            while t <= duration:
+                i_values.append(i_val)
+                times.append(t)
+                if l_s > 0:
+                    di_dt = -i_val * (r_a / l_s)
+                    i_val += di_dt * step
+                t += step
+
+        angle = math.radians(-phi_deg)
+        for i_val, t in zip(i_values, times):
+            i_complex = i_val * (math.cos(angle) + 1j * math.sin(angle))
+            v_phase = e_phase - (r_a + 1j * x_s) * i_complex
+            voltages.append(abs(v_phase) * math.sqrt(3))
+            currents.append(abs(i_complex))
+
+        return times, currents, voltages
+
+
 class SynchronousReluctanceMotor:
     """Mathematical model of a synchronous reluctance motor"""
 
@@ -222,6 +317,7 @@ class MotorSimulationGUI:
 
         # Initialize motor
         self.motor = SynchronousReluctanceMotor()
+        self.alternator = AlternatorAnalysis(frequency=self.motor.freq)
 
         # Simulation parameters
         self.is_running = False
@@ -413,6 +509,12 @@ class MotorSimulationGUI:
         # Tab 3: Characteristics
         self.setup_characteristics_plot()
 
+        # Tab 4: Alternator Lab
+        self.setup_alternator_tab()
+
+        # Tab 5: Advanced Analysis
+        self.setup_advanced_tab()
+
     def setup_realtime_plots(self):
         """Setup real-time plotting tab"""
         plot_frame = ttk.Frame(self.notebook)
@@ -478,6 +580,173 @@ class MotorSimulationGUI:
 
         self.canvas_char = FigureCanvasTkAgg(self.fig_char, master=char_frame)
         self.canvas_char.draw()
+
+    def setup_alternator_tab(self):
+        """Create alternator-focused calculation tab."""
+        alt_frame = ttk.Frame(self.notebook)
+        self.notebook.add(alt_frame, text="Alternator Lab")
+
+        # Inputs
+        input_frame = ttk.LabelFrame(alt_frame, text="Input Parameters", padding="10")
+        input_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.alt_entries = {}
+        alt_params = [
+            ("e_oc", "Open-Circuit Voltage (V)", 1500.0),
+            ("i_sc", "Short-Circuit Current (A)", 250.0),
+            ("r_a", "Armature Resistance (Ω)", 2.0),
+            ("v_line", "Rated Line Voltage (V)", 6600.0),
+            ("i_load", "Load Current (A)", 250.0),
+            ("pf", "Power Factor (lagging)", 0.8),
+        ]
+
+        for idx, (key, label, default) in enumerate(alt_params):
+            row = ttk.Frame(input_frame)
+            row.pack(fill=tk.X, pady=3)
+            ttk.Label(row, text=label, width=28).pack(side=tk.LEFT)
+            var = tk.DoubleVar(value=default)
+            entry = ttk.Entry(row, textvariable=var, width=18)
+            entry.pack(side=tk.LEFT, padx=5)
+            self.alt_entries[key] = var
+
+        ttk.Button(input_frame, text="Compute", command=self.compute_alternator).pack(
+            fill=tk.X, pady=10
+        )
+
+        # Results
+        result_frame = ttk.LabelFrame(alt_frame, text="Results", padding="10")
+        result_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.alt_results = {}
+        result_labels = [
+            ("Synchronous Impedance |Zs| (Ω)", "z_s"),
+            ("Synchronous Reactance Xs (Ω)", "x_s"),
+            ("No-load Line Voltage (V)", "no_load_voltage_line"),
+            ("Voltage Regulation (%)", "voltage_regulation_pct"),
+            ("Power Factor Angle (deg)", "power_factor_angle_deg"),
+        ]
+
+        for label, key in result_labels:
+            row = ttk.Frame(result_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label + ":", width=28).pack(side=tk.LEFT)
+            val_label = ttk.Label(row, text="-")
+            val_label.pack(side=tk.LEFT, padx=5)
+            self.alt_results[key] = val_label
+
+        info = (
+            "The alternator lab models synchronous impedance using open-circuit "
+            "and short-circuit tests, then estimates the no-load terminal voltage "
+            "after a sudden load rejection."
+        )
+        ttk.Label(result_frame, text=info, wraplength=360, foreground="gray").pack(
+            fill=tk.X, pady=10
+        )
+
+        self.compute_alternator()
+
+    def setup_advanced_tab(self):
+        """Comprehensive analysis tab with voltage recovery simulation."""
+        adv_frame = ttk.Frame(self.notebook)
+        self.notebook.add(adv_frame, text="Advanced Analysis")
+
+        control_frame = ttk.LabelFrame(adv_frame, text="Load Rejection Simulation", padding="10")
+        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+
+        ttk.Label(control_frame, text="Duration (s)").pack(anchor=tk.W)
+        self.adv_duration = tk.DoubleVar(value=0.6)
+        ttk.Scale(control_frame, from_=0.1, to=2.0, variable=self.adv_duration,
+                  orient=tk.HORIZONTAL).pack(fill=tk.X, pady=3)
+
+        ttk.Label(control_frame, text="Step (s)").pack(anchor=tk.W)
+        self.adv_step = tk.DoubleVar(value=0.01)
+        ttk.Scale(control_frame, from_=0.001, to=0.05, variable=self.adv_step,
+                  orient=tk.HORIZONTAL).pack(fill=tk.X, pady=3)
+
+        ttk.Button(control_frame, text="Run Load-Shedding Study",
+                  command=self.run_advanced_study).pack(fill=tk.X, pady=8)
+
+        ttk.Label(control_frame, text="Solver").pack(anchor=tk.W, pady=(8, 0))
+        ttk.Radiobutton(control_frame, text="RK45", variable=self.solver_method,
+                       value="RK45").pack(anchor=tk.W)
+        ttk.Radiobutton(control_frame, text="Euler", variable=self.solver_method,
+                       value="Euler").pack(anchor=tk.W)
+
+        plot_frame = ttk.LabelFrame(adv_frame, text="Dynamic Response", padding="10")
+        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.fig_adv = Figure(figsize=(7, 5), dpi=100)
+        self.fig_adv.subplots_adjust(hspace=0.35)
+        self.ax_adv_voltage = self.fig_adv.add_subplot(211)
+        self.ax_adv_current = self.fig_adv.add_subplot(212)
+
+        self.ax_adv_voltage.set_ylabel("Voltage (V)")
+        self.ax_adv_current.set_ylabel("Current (A)")
+        self.ax_adv_current.set_xlabel("Time (s)")
+
+        self.canvas_adv = FigureCanvasTkAgg(self.fig_adv, master=plot_frame)
+        self.canvas_adv.draw()
+        self.canvas_adv.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def compute_alternator(self):
+        """Compute alternator parameters and update labels."""
+        e_oc = self.alt_entries["e_oc"].get()
+        i_sc = self.alt_entries["i_sc"].get()
+        r_a = self.alt_entries["r_a"].get()
+        v_line = self.alt_entries["v_line"].get()
+        i_load = self.alt_entries["i_load"].get()
+        pf = self.alt_entries["pf"].get()
+
+        results = self.alternator.compute_parameters(e_oc, i_sc, r_a, v_line, i_load, pf)
+
+        for key, label in self.alt_results.items():
+            value = results.get(key, 0)
+            if isinstance(value, complex):
+                text = f"{abs(value):.2f} ∠ {math.degrees(math.atan2(value.imag, value.real)):.1f}°"
+            else:
+                text = f"{value:.3f}" if abs(value) < 1e4 else f"{value:,.1f}"
+            label.config(text=text)
+
+        self.latest_alternator = results
+        self.status_var.set("Alternator parameters updated")
+
+    def run_advanced_study(self):
+        """Run voltage recovery simulation for the alternator."""
+        if not hasattr(self, "latest_alternator"):
+            self.compute_alternator()
+
+        r_a = self.alt_entries["r_a"].get()
+        i_load = self.alt_entries["i_load"].get()
+        e_phase = self.latest_alternator.get("e_phase", 0)
+        x_s = self.latest_alternator.get("x_s", 0)
+        phi_deg = self.latest_alternator.get("power_factor_angle_deg", 0)
+
+        duration = self.adv_duration.get()
+        step = self.adv_step.get()
+
+        times, currents, voltages = self.alternator.simulate_load_rejection(
+            e_phase, r_a, x_s, i_load, phi_deg, duration, step, method=self.solver_method.get()
+        )
+
+        self.ax_adv_voltage.clear()
+        self.ax_adv_current.clear()
+        self.ax_adv_voltage.plot(times, voltages, 'b-', label='Terminal Voltage (line)')
+        self.ax_adv_current.plot(times, currents, 'r-', label='Armature Current')
+
+        self.ax_adv_voltage.set_title("Load Rejection Voltage Recovery")
+        self.ax_adv_voltage.set_ylabel("Voltage (V)")
+        self.ax_adv_voltage.grid(True, alpha=0.3)
+        self.ax_adv_voltage.legend()
+
+        self.ax_adv_current.set_title("Current Decay")
+        self.ax_adv_current.set_ylabel("Current (A)")
+        self.ax_adv_current.set_xlabel("Time (s)")
+        self.ax_adv_current.grid(True, alpha=0.3)
+        self.ax_adv_current.legend()
+
+        self.fig_adv.tight_layout()
+        self.canvas_adv.draw()
+        self.status_var.set("Advanced voltage recovery study completed")
         self.canvas_char.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # Initial plot
@@ -853,9 +1122,21 @@ class MotorSimulationGUI:
 
     def on_window_resize(self, event):
         """Handle window resize event for auto-scaling"""
-        # This is called when window is resized
-        # The grid weight configuration handles auto-scaling
-        pass
+        figures = [self.fig_realtime, self.fig_phasor, self.fig_char]
+        if hasattr(self, "fig_adv"):
+            figures.append(self.fig_adv)
+
+        for fig in figures:
+            fig.tight_layout()
+
+        if hasattr(self, "canvas_realtime"):
+            self.canvas_realtime.draw_idle()
+        if hasattr(self, "canvas_phasor"):
+            self.canvas_phasor.draw_idle()
+        if hasattr(self, "canvas_char"):
+            self.canvas_char.draw_idle()
+        if hasattr(self, "canvas_adv"):
+            self.canvas_adv.draw_idle()
 
     def save_results(self):
         """Save results to file"""
